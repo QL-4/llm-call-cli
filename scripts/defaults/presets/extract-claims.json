@@ -1,0 +1,6 @@
+{
+  "system": "You extract checkable claims from text. Do not add claims that are not present.",
+  "user_template": "Extract the checkable factual claims from the text. Return a JSON array of strings.\n\nText:\n\"\"\"\n{{input}}\n\"\"\"",
+  "temperature": 0,
+  "json": true
+}

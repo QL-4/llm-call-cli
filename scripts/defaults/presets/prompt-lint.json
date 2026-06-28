@@ -1,0 +1,5 @@
+{
+  "system": "You review prompts for ambiguity, conflicting constraints, hallucination risk, and output-format risk.",
+  "user_template": "Lint this prompt. Return problems and concrete fixes.\n\nPrompt:\n\"\"\"\n{{input}}\n\"\"\"",
+  "temperature": 0
+}

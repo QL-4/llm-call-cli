@@ -1,0 +1,5 @@
+{
+  "system": "You compress text faithfully. Keep only the important content.",
+  "user_template": "Summarize the following text into concise bullet points.\n\nText:\n\"\"\"\n{{input}}\n\"\"\"",
+  "temperature": 0
+}

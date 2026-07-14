@@ -31,16 +31,25 @@ def _request(
     timeout: float,
     body: bytes | None = None,
 ) -> Dict[str, Any]:
-    """Send an HTTP request using http.client."""
+    """Send an HTTP request using http.client.
+
+    Uses a direct connection (does not honor HTTP(S)_PROXY env vars).
+    This avoids RemoteDisconnected issues seen with urllib on Python 3.13
+    behind some local reverse proxies (e.g. CPA).
+    """
     parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise LlmCallError(
+            f"Unsupported URL scheme {parsed.scheme!r} for LLM endpoint ({url}).",
+            "base_url must start with http:// or https://. Use: python scripts/llm_call.py --show-config",
+        )
+
     host = parsed.hostname or "localhost"
     port = parsed.port
     path = parsed.path or "/"
-
-    if parsed.scheme == "https":
-        conn = http.client.HTTPSConnection(host, port, timeout=timeout)
-    else:
-        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -49,7 +58,14 @@ def _request(
     if body is not None:
         headers["Content-Type"] = "application/json"
 
+    conn: http.client.HTTPConnection | None = None
+    raw = b""
     try:
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+
         conn.request(method, path, body=body, headers=headers)
         resp = conn.getresponse()
         raw = resp.read()
@@ -66,33 +82,41 @@ def _request(
             )
 
         return json.loads(raw.decode("utf-8"))
+    except LlmCallError:
+        raise
+    except http.client.RemoteDisconnected as exc:
+        raise LlmCallError(
+            f"LLM endpoint closed the connection unexpectedly ({url}).\n  Reason: {exc}",
+            "The server or local proxy may have dropped keep-alive. Retry, or verify base_url/proxy with: python scripts/llm_call.py --show-config",
+        ) from exc
     except http.client.HTTPException as exc:
         raise LlmCallError(
             f"HTTP protocol error from LLM endpoint ({url}).\n  Reason: {exc}",
-            "Check that the base_url is correct and the server is running. Use: python scripts/llm_call.py --show-config"
+            "Check that the base_url is correct and the server is running. Use: python scripts/llm_call.py --show-config",
         ) from exc
     except (ConnectionRefusedError, ConnectionResetError) as exc:
         raise LlmCallError(
             f"Cannot connect to LLM endpoint at {url}.\n  Reason: {exc}",
-            "Check that the server is running and base_url is correct. Use: python scripts/llm_call.py --show-config"
+            "Check that the server is running and base_url is correct. Use: python scripts/llm_call.py --show-config",
         ) from exc
     except TimeoutError as exc:
         raise LlmCallError(
             f"Connection to LLM endpoint timed out ({url}).\n  Reason: {exc}",
-            "The server may be overloaded or the network is slow. Try again or increase --timeout."
+            "The server may be overloaded or the network is slow. Try again or increase --timeout.",
         ) from exc
     except OSError as exc:
         raise LlmCallError(
             f"Network error reaching LLM endpoint ({url}).\n  Reason: {exc}",
-            "Check network connectivity and base_url. Use: python scripts/llm_call.py --show-config"
+            "Check network connectivity and base_url. Use: python scripts/llm_call.py --show-config",
         ) from exc
     except json.JSONDecodeError as exc:
         raise LlmCallError(
             f"LLM endpoint returned invalid JSON ({url}).\n  Response: {raw.decode('utf-8', errors='replace')[:300]}",
-            "The endpoint may have returned an error page or HTML instead of JSON. Check the model name and base_url."
+            "The endpoint may have returned an error page or HTML instead of JSON. Check the model name and base_url.",
         ) from exc
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def post_chat_completions(

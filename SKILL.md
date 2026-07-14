@@ -41,7 +41,7 @@ Options:
 
 ### Prompting rules
 
-When invoking llm_call.py, do not pass --timeout — use the default (900 s).
+**Caller timeout:** If you are an AI assistant invoking llm_call.py via a shell tool, ensure your own tool timeout is at least 120 s.
 
 1. Put the task in the prompt argument and the source text in stdin.
 2. `--temperature 0` for checking/extraction/judging; higher (e.g. `0.7`) for creative drafting.

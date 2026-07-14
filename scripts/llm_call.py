@@ -13,8 +13,10 @@ Each call writes a single human-readable markdown log under
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as _dt
 import json
+import mimetypes
 import os
 import re
 import sys
@@ -73,7 +75,7 @@ def _make_log_name(model: str) -> str:
     return f"{stamp}_{_safe_path_token(model)}.md"
 
 
-def _write_run_log(model: str, base_url: str, system: str, user: str, output: str) -> None:
+def _write_run_log(model: str, base_url: str, system: str, user: object, output: str) -> None:
     """Best-effort single human-readable markdown log. Silent on failure."""
     try:
         log_dir = llm_call_log_dir()
@@ -81,13 +83,14 @@ def _write_run_log(model: str, base_url: str, system: str, user: str, output: st
         path = log_dir / _make_log_name(model)
         if path.exists():
             path = log_dir / f"{path.stem}_{_dt.datetime.now().strftime('%f')}.md"
+        user_str = json.dumps(user, ensure_ascii=False) if isinstance(user, list) else str(user).strip()
         body = (
             f"# llm-call log\n\n"
             f"- time: {_now_display()}\n"
             f"- model: {model}\n"
             f"- base_url: {base_url}\n\n"
             f"## system\n\n{system.strip()}\n\n"
-            f"## user\n\n{user.strip()}\n\n"
+            f"## user\n\n{user_str}\n\n"
             f"## output\n\n{output.strip()}\n"
         )
         path.write_text(body, encoding="utf-8")
@@ -234,6 +237,8 @@ _PRESET_DESCRIPTIONS: Dict[str, str] = {
     "concept-check": "check whether an explanation/analogy is conceptually wrong or misleading",
     "extract-claims": "extract checkable factual claims as JSON",
     "prompt-lint": "check a prompt for ambiguity, conflicting constraints, hallucination/output-format risk",
+    "describe-figure": "exhaustive structured description of a scientific figure for downstream text-only models (requires --image)",
+    "polish-sentence": "academic single-sentence polish: precise, formal, meaning-preserving",
 }
 
 
@@ -265,7 +270,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--json", action="store_true", help="Ask for JSON output and validate if possible.")
     parser.add_argument("--lint", action="store_true", help="Lint invocation and exit without calling provider")
     parser.add_argument("--lint-override", help="Allow lint errors with explicit reason")
-    parser.add_argument("--timeout", type=float, default=None, help="Request timeout seconds (default: no HTTP timeout).")
+    parser.add_argument("--image", action="append", dest="images", help="Image file path(s) to include in the request (can be used multiple times).")
+    parser.add_argument("--timeout", type=float, default=900, help="Request timeout seconds (default: 900 = 15 min).")
     parser.add_argument("--show-config", action="store_true", help="Print resolved model/base_url with api_key redacted.")
     args = parser.parse_args(argv)
 
@@ -310,8 +316,26 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     messages = [
         {"role": "system", "content": str(system)},
-        {"role": "user", "content": user},
     ]
+
+    if args.images:
+        content_parts: list[dict] = [{"type": "text", "text": user}]
+        for img_path in args.images:
+            path = Path(img_path)
+            if not path.exists():
+                raise SystemExit(f"llm-call: image file not found: {img_path}")
+            mime_type, _ = mimetypes.guess_type(str(path))
+            if mime_type is None:
+                mime_type = "image/png"
+            b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{b64}"},
+            })
+        messages.append({"role": "user", "content": content_parts})
+    else:
+        messages.append({"role": "user", "content": user})
+
     if wants_json:
         messages[0]["content"] += "\nReturn valid JSON only. Do not wrap it in Markdown."
 
@@ -370,7 +394,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception:
             rendered = None
 
-    print(rendered if rendered is not None else content)
+    print(rendered if rendered is not None else content, flush=True)
 
     _write_run_log(resolved["model"], resolved["base_url"], str(system), user, rendered if rendered is not None else content)
 

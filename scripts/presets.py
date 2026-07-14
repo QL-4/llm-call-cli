@@ -74,6 +74,8 @@ _PRESET_DESCRIPTIONS: Dict[str, str] = {
     "concept-check": "check whether an explanation/analogy is conceptually wrong or misleading",
     "extract-claims": "extract checkable factual claims as JSON",
     "prompt-lint": "check a prompt for ambiguity, conflicting constraints, hallucination/output-format risk",
+    "describe-figure": "exhaustive structured description of a scientific figure for downstream text-only models (requires --image)",
+    "polish-sentence": "academic single-sentence polish: precise, formal, meaning-preserving",
 }
 
 

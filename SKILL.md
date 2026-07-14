@@ -9,27 +9,36 @@ A one-shot, clean-context LLM call (`scripts/llm_call.py`): no history, no memor
 
 ## How to use
 
-Call the script directly. Same invocation on every platform:
+Submit as an sbatch job via the wrapper script:
 
 ```bash
-python scripts/llm_call.py "把这句话改得更温和：我不同意这个方案"
-printf '今天很累，但还是写完了实验记录。' | python scripts/llm_call.py "提炼一句今日复盘"
-printf '文章内容...' | python scripts/llm_call.py --preset summarize
-printf '文章内容...' | python scripts/llm_call.py --preset extract-claims --json
-python scripts/llm_call.py --list-presets
+bash scripts/llm_call.sh "把这句话改得更温和：我不同意这个方案"
+printf '今天很累，但还是写完了实验记录。' | bash scripts/llm_call.sh "提炼一句今日复盘"
+printf '文章内容...' | bash scripts/llm_call.sh --preset summarize
+printf '文章内容...' | bash scripts/llm_call.sh --preset extract-claims --json
+bash scripts/llm_call.sh --list-presets
 ```
 
-Options:
+The wrapper creates an sbatch job that runs `scripts/llm_call.py` on a compute node. Output is written to `scripts/sbatch_output/<jobid>-<jobname>.md`.
+
+Options (passed through to `llm_call.py`):
 
 ```
 --system TEXT        One-call system message
---preset NAME        Preset name (see `python scripts/presets.py list`)
+--preset NAME        Preset name (see `bash scripts/llm_call.sh --list-presets`)
 --model MODEL        Override the configured model
 --temperature FLOAT  Lower for judging/extraction; higher for creative drafting
 --json               Request JSON-only output
 --max-tokens N       Cap completion length
---timeout SECONDS    Optional HTTP timeout (default: none)
+--image PATH         Include an image file (can be used multiple times for multiple images)
 --lint-override R    Bypass the placeholder lint with a stated reason
+```
+
+Example with vision:
+
+```bash
+bash scripts/llm_call.sh --model mimo-v2.5 --image /path/to/image.png "描述这张图片"
+bash scripts/llm_call.sh --model mimo-v2.5 --image img1.png --image img2.png "对比两张图片"
 ```
 
 ## Config
@@ -57,10 +66,36 @@ python scripts/presets.py reset [--force]                   # overwrite all with
 
 `user_template` supports `{{input}}` (stdin text) and `{{prompt}}` (prompt arg) placeholders.
 
+## Vision preset: describe-figure
+
+`describe-figure` converts any image into an exhaustive structured plain-text description for downstream text-only models. It works for all image types: charts/plots, diagrams, pipeline visualizations, annotated renders, floor plans, photographs, and composites.
+
+**Requires a multimodal model** (e.g. `mimo-v2.5`). The default text-only model will return HTTP 400.
+
+```bash
+# Describe a single image
+bash scripts/llm_call.sh --model mimo-v2.5 --preset describe-figure --image /path/to/figure.png
+
+# Pipe the description into a text-only model for follow-up reasoning
+bash scripts/llm_call.sh --model mimo-v2.5 --preset describe-figure --image fig.png \
+  | bash scripts/llm_call.sh "根据以上图像描述，指出需要改进的地方"
+```
+
+Output structure (auto-selected by image type):
+- **Step 1** — image type classification (chart/plot, diagram, spatial/scene, annotated image, composite, etc.)
+- **A** Layout (shape, panels, background, titles)
+- **B** Chart/plot content (axes, series, colorbars, legend) — if applicable
+- **C** Spatial/scene content (viewpoint, objects, positions, relationships) — if applicable
+- **D** Overlays and annotations (bounding boxes, masks, graph overlays, arrows)
+- **E** All text and labels (exact strings, colors, positions)
+- **F** Color inventory
+- **G** Visual quality notes
+- **H** Concise summary (3–5 sentences)
+
 ## Prompting rules
 
 1. Put the task in the prompt argument and the source text in stdin.
 2. `--temperature 0` for checking/extraction/judging; higher (e.g. `0.7`) for creative drafting.
-3. Do not set a short `--timeout` — by default there is none; let the call finish unless the user asks to cancel.
+3. Output lands in `scripts/sbatch_output/` — monitor with `tail -f <path>`.
 
 Treat output as model text, not verified fact; verify important claims separately.

@@ -38,7 +38,6 @@ Options:
 --show-config        Print resolved model/base_url with api_key redacted
 --list-models        List available models from the configured endpoint
 ```
-```
 
 ### Prompting rules
 

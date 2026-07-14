@@ -1,268 +1,67 @@
 #!/usr/bin/env python3
-"""Standalone single-shot LLM CLI.
+"""Standalone single-shot LLM CLI with config init and preset management.
 
 Self-contained: reads its own ~/.llm-call/config.json (or $LLM_CALL_HOME) for
 model/base_url, and ~/.llm-call/config.json api_key or the LLM_CALL_API_KEY
 env var for credentials.
 
 One clean request, then exit. No tools, no memory, no session history.
-Each call writes a single human-readable markdown log under
-~/.llm-call/logs/ (default on, silent to stdout, no api_key).
+Each call appends one JSON record to ~/.llm-call/log.jsonl (prompt, model,
+output; no api_key; no image bytes).
+
+Subcommands:
+  llm_call.py [prompt] [options]   default: make an LLM call
+  llm_call.py init [options]       write/merge config + seed presets
+  llm_call.py preset <subcommand>  manage presets
+
+All errors are printed to stdout (not stderr) as actionable instructions,
+because the primary consumer is an agent that reads stdout.
+
+Internal modules _config, _presets, _api live alongside this file but are
+not part of the public interface — the agent only invokes llm_call.py.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
-import datetime as _dt
+import getpass
 import json
 import mimetypes
 import os
-import re
+import shutil
+import subprocess
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-# Self-contained UTF-8 for stdin/stdout/stderr so the CLI works without a
-# wrapper setting PYTHONIOENCODING (e.g. on Windows where the default codepage
-# would otherwise mangle non-ASCII text).
-for _stream in (sys.stdin, sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+from _config import (
+    LlmCallError, error, die,
+    llm_call_home, config_path, presets_dir, defaults_presets_dir,
+    utc_now, load_json,
+    append_log, resolve_config,
+    merge_config, write_config, seed_presets, print_resolved,
+    perm_hint,
+)
+from _presets import (
+    load_preset, read_stdin, render_template,
+    lint_invocation, print_presets,
+)
+from _api import post_chat_completions
 
 
-def llm_call_home() -> Path:
-    return Path(os.environ.get("LLM_CALL_HOME") or Path.home() / ".llm-call").expanduser()
+# ---------------------------------------------------------------------------
+# Call mode
+# ---------------------------------------------------------------------------
 
-
-def llm_call_config_path() -> Path:
-    return llm_call_home() / "config.json"
-
-
-def llm_call_log_dir() -> Path:
-    return llm_call_home() / "logs"
-
-
-def llm_call_presets_dir() -> Path:
-    return llm_call_home() / "presets"
-
-
-def _now_display() -> str:
-    """Local wall-clock time, human-readable, no microseconds/timezone suffix."""
-    return _dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _safe_path_token(value: str) -> str:
-    chars: list[str] = []
-    for ch in value.strip():
-        if ch.isalnum() or ch in {".", "-", "_"}:
-            chars.append(ch)
-        else:
-            chars.append("-")
-    token = "".join(chars).strip(".-_")
-    while "--" in token:
-        token = token.replace("--", "-")
-    return token or "model"
-
-
-def _make_log_name(model: str) -> str:
-    now = _dt.datetime.now().astimezone()
-    stamp = now.strftime("%y-%m-%d_%H.%M.%S")
-    return f"{stamp}_{_safe_path_token(model)}.md"
-
-
-def _write_run_log(model: str, base_url: str, system: str, user: object, output: str) -> None:
-    """Best-effort single human-readable markdown log. Silent on failure."""
-    try:
-        log_dir = llm_call_log_dir()
-        log_dir.mkdir(parents=True, exist_ok=True)
-        path = log_dir / _make_log_name(model)
-        if path.exists():
-            path = log_dir / f"{path.stem}_{_dt.datetime.now().strftime('%f')}.md"
-        user_str = json.dumps(user, ensure_ascii=False) if isinstance(user, list) else str(user).strip()
-        body = (
-            f"# llm-call log\n\n"
-            f"- time: {_now_display()}\n"
-            f"- model: {model}\n"
-            f"- base_url: {base_url}\n\n"
-            f"## system\n\n{system.strip()}\n\n"
-            f"## user\n\n{user_str}\n\n"
-            f"## output\n\n{output.strip()}\n"
-        )
-        path.write_text(body, encoding="utf-8")
-    except Exception:
-        return
-
-
-def _load_env() -> None:
-    """Tiny dotenv loader to avoid depending on python-dotenv in system Python."""
-    env_path = llm_call_home() / ".env"
-    if not env_path.exists():
-        return
-    for raw_line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not key or key in os.environ:
-            continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            value = value[1:-1]
-        os.environ[key] = value
-
-
-def _load_json(path: Path) -> Dict[str, Any]:
-    """Read a JSON object, returning {} when missing or invalid."""
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _resolve_config(model_override: Optional[str], *, strict: bool = True) -> Dict[str, str]:
-    _load_env()
-    cfg = _load_json(llm_call_config_path())
-
-    model = (model_override or cfg.get("model") or "").strip()
-    base_url = (cfg.get("base_url") or "").strip().rstrip("/")
-    api_key = (cfg.get("api_key") or os.environ.get("LLM_CALL_API_KEY", "")).strip()
-    api_mode = (cfg.get("api_mode") or "chat_completions").strip()
-
-    missing: list[str] = []
-    if not model:
-        missing.append("model")
-    if not base_url:
-        missing.append("base_url")
-    if not api_key:
-        missing.append("api_key")
-
-    if strict and missing:
-        # Agent-facing guidance: when config is incomplete, point the caller at
-        # init.py. init.py merges updates, so to change a single field (e.g. the
-        # model) pass only that flag; to set up from scratch pass all three.
-        raise SystemExit(
-            "llm-call: not configured (" + ", ".join(missing) + " missing).\n"
-            "Run `python scripts/init.py --base-url URL --model MODEL --api-key KEY` "
-            "to initialize ~/.llm-call (ask the user for the missing values; "
-            "api_mode defaults to chat_completions). To change a single field, "
-            "pass only that flag, e.g. `--model new-model`. Then retry this call."
-        )
-    if api_mode and api_mode not in {"chat_completions", "openai", "openai_chat"}:
-        raise SystemExit(f"llm-call: unsupported api_mode for this tiny CLI: {api_mode}")
-
-    return {
-        "model": str(model),
-        "base_url": base_url,
-        "api_key": api_key,
-        "api_mode": api_mode,
-        "config_home": str(llm_call_home()),
-        "llm_call_config": str(llm_call_config_path()),
-        "missing": ",".join(missing),
-    }
-
-
-def _is_valid_preset(path: Path) -> bool:
-    if not path.exists():
-        return False
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    return isinstance(data, dict) and isinstance(data.get("user_template"), str)
-
-
-def _available_preset_names() -> list[str]:
-    d = llm_call_presets_dir()
-    if not d.exists():
-        return []
-    return sorted(p.stem for p in d.glob("*.json") if _is_valid_preset(p))
-
-
-def _load_preset(name: str) -> Dict[str, Any]:
-    path = llm_call_presets_dir() / f"{name}.json"
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            raise SystemExit(f"llm-call: preset {name!r} is not valid JSON at {path}")
-        if not isinstance(data, dict) or not isinstance(data.get("user_template"), str):
-            raise SystemExit(f"llm-call: preset {name!r} must be a JSON object with a 'user_template' string")
-        return data
-    known = ", ".join(_available_preset_names())
-    hint = f" Available: {known}." if known else " Run `python scripts/init.py` to seed built-ins."
-    raise SystemExit(f"llm-call: preset {name!r} not found.{hint}")
-
-
-def _read_stdin() -> str:
-    if sys.stdin is not None and not sys.stdin.isatty():
-        try:
-            return sys.stdin.read()
-        except OSError:
-            # Pytest capture and some gateways expose a non-tty stdin that must not be read.
-            return ""
-    return ""
-
-
-def _render_template(template: str, input_text: str, prompt: str) -> str:
-    return template.replace("{{input}}", input_text).replace("{{prompt}}", prompt)
-
-
-PLACEHOLDER_PATTERNS = [r"\$\(cat\s+[^)]+\)", r"<insert[^>]*>", r"TODO\s*:?"]
-
-
-def lint_invocation(prompt: str, input_text: str) -> Dict[str, Any]:
-    """Generic preflight lint: block unresolved artifact placeholders."""
-    findings = []
-    text = (prompt or "") + "\n" + (input_text or "")
-    for pat in PLACEHOLDER_PATTERNS:
-        if re.search(pat, text, flags=re.I):
-            findings.append({"rule": "unresolved_artifact_placeholder", "severity": "error", "message": f"Unresolved artifact placeholder matched: {pat}"})
-            break
-    ok = not findings
-    return {"ok": ok, "findings": findings}
-
-
-_PRESET_DESCRIPTIONS: Dict[str, str] = {
-    "summarize": "faithful concise bullet summary",
-    "judge": "independent evaluator: verdict, rationale, improvement",
-    "concept-check": "check whether an explanation/analogy is conceptually wrong or misleading",
-    "extract-claims": "extract checkable factual claims as JSON",
-    "prompt-lint": "check a prompt for ambiguity, conflicting constraints, hallucination/output-format risk",
-    "describe-figure": "exhaustive structured description of a scientific figure for downstream text-only models (requires --image)",
-    "polish-sentence": "academic single-sentence polish: precise, formal, meaning-preserving",
-}
-
-
-def _print_presets() -> None:
-    names = _available_preset_names()
-    if not names:
-        print(f"No presets found in {llm_call_presets_dir()}.")
-        print("Run `python scripts/init.py` to seed built-ins.")
-        return
-    print("Presets (use with --preset NAME):")
-    for name in names:
-        desc = _PRESET_DESCRIPTIONS.get(name)
-        print(f"  {name}" + (f" — {desc}" if desc else ""))
-    print("Manage presets with `python scripts/presets.py`.")
-
-
-def main(argv: Optional[list[str]] = None) -> int:
+def cmd_call(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="llm-call",
         description="Single-shot LLM call: no tools, no memory, no session history.",
     )
     parser.add_argument("prompt", nargs="*", help="Prompt text. stdin is appended/used as input.")
     parser.add_argument("--system", help="System message for this one call.")
-    parser.add_argument("--preset", help="Preset name (see `python scripts/presets.py list`).")
+    parser.add_argument("--preset", help="Preset name (see `llm_call.py preset list`).")
     parser.add_argument("--list-presets", action="store_true", help="List available presets and exit.")
     parser.add_argument("--model", help="Override model for this call.")
     parser.add_argument("--temperature", type=float, help="Sampling temperature.")
@@ -276,31 +75,34 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.list_presets:
-        _print_presets()
+        print_presets()
         return 0
 
     if args.show_config:
-        resolved = _resolve_config(args.model, strict=False)
+        resolved = resolve_config(args.model, strict=False)
         print(json.dumps({k: ("[REDACTED]" if k == "api_key" and v else v) for k, v in resolved.items()}, ensure_ascii=False, indent=2))
         return 0
 
     prompt = " ".join(args.prompt).strip()
-    stdin_text = _read_stdin()
+    stdin_text = read_stdin()
     preset: Dict[str, Any] = {}
     if args.preset:
-        preset = _load_preset(args.preset)
+        preset = load_preset(args.preset)
 
     lint_result = lint_invocation(prompt, stdin_text)
     if args.lint:
         print(json.dumps(lint_result, ensure_ascii=False, indent=2))
         return 0 if lint_result["ok"] else 2
     if not lint_result["ok"] and not args.lint_override:
-        print(json.dumps(lint_result, ensure_ascii=False, indent=2), file=sys.stderr)
-        return 2
+        finding = lint_result["findings"][0]
+        return error(
+            f"lint blocked the call: {finding['message']}",
+            'Review the input and remove the placeholder, or re-run with --lint-override "reason".'
+        )
 
     system = args.system if args.system is not None else preset.get("system", "You are a concise, accurate assistant.")
     if preset.get("user_template"):
-        user = _render_template(str(preset["user_template"]), stdin_text, prompt)
+        user = render_template(str(preset["user_template"]), stdin_text, prompt)
     else:
         if stdin_text and prompt:
             user = f"{prompt}\n\nInput:\n\"\"\"\n{stdin_text}\n\"\"\""
@@ -308,22 +110,26 @@ def main(argv: Optional[list[str]] = None) -> int:
             user = prompt or stdin_text
 
     if not user.strip():
-        raise SystemExit("llm-call: provide a prompt argument or stdin")
+        return error(
+            "no prompt provided",
+            'Pass a prompt argument or pipe text via stdin, e.g.: python scripts/llm_call.py "your prompt"'
+        )
 
-    resolved = _resolve_config(args.model)
+    resolved = resolve_config(args.model)
     temperature = args.temperature if args.temperature is not None else preset.get("temperature", 0.2)
     wants_json = bool(args.json or preset.get("json"))
 
-    messages = [
+    messages: list[dict] = [
         {"role": "system", "content": str(system)},
     ]
 
+    image_paths: list[str] = []
     if args.images:
         content_parts: list[dict] = [{"type": "text", "text": user}]
         for img_path in args.images:
             path = Path(img_path)
             if not path.exists():
-                raise SystemExit(f"llm-call: image file not found: {img_path}")
+                return error(f"image file not found: {img_path}", "Check the path, or use an absolute path.")
             mime_type, _ = mimetypes.guess_type(str(path))
             if mime_type is None:
                 mime_type = "image/png"
@@ -332,6 +138,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime_type};base64,{b64}"},
             })
+            image_paths.append(str(path))
         messages.append({"role": "user", "content": content_parts})
     else:
         messages.append({"role": "user", "content": user})
@@ -351,38 +158,31 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     request_url = resolved["base_url"].rstrip("/") + "/chat/completions"
 
-    def _post_chat_completions(body: Dict[str, Any]) -> Dict[str, Any]:
-        payload = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(
-            request_url,
-            data=payload,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {resolved['api_key']}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=args.timeout) as resp:
-                raw = resp.read().decode("utf-8")
-                return json.loads(raw)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} from LLM endpoint: {detail}") from exc
-
     try:
-        response = _post_chat_completions(request_body)
-    except Exception:
+        response = post_chat_completions(request_url, resolved["api_key"], request_body, args.timeout)
+    except LlmCallError as exc:
+        # Retry once without response_format if --json caused the failure
         if wants_json and "response_format" in request_body:
             request_body.pop("response_format", None)
-            response = _post_chat_completions(request_body)
+            try:
+                response = post_chat_completions(request_url, resolved["api_key"], request_body, args.timeout)
+            except LlmCallError as exc2:
+                msg = exc2.args[0] if exc2.args else str(exc2)
+                hint = exc2.args[1] if len(exc2.args) > 1 else ""
+                return error(str(msg), hint)
         else:
-            raise
+            msg = exc.args[0] if exc.args else str(exc)
+            hint = exc.args[1] if len(exc.args) > 1 else ""
+            return error(str(msg), hint)
+    except Exception as exc:
+        return error(f"unexpected error: {exc}", "This may be a bug. Check the command and config, then retry.")
 
     choices = response.get("choices") or []
     if not choices:
-        raise SystemExit(f"llm-call: response has no choices: {json.dumps(response, ensure_ascii=False)[:500]}")
+        return error(
+            f"response has no choices: {json.dumps(response, ensure_ascii=False)[:500]}",
+            "The endpoint may have returned an error page instead of a chat completion. Check the model name and base_url."
+        )
     message = choices[0].get("message") or {}
     content = str(message.get("content") or "")
 
@@ -396,12 +196,279 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print(rendered if rendered is not None else content, flush=True)
 
-    _write_run_log(resolved["model"], resolved["base_url"], str(system), user, rendered if rendered is not None else content)
+    log_record = {
+        "time": utc_now(),
+        "model": resolved["model"],
+        "system": str(system).strip(),
+        "user": user if isinstance(user, str) else json.dumps(user, ensure_ascii=False),
+        "output": rendered if rendered is not None else content,
+        "temperature": temperature,
+    }
+    if image_paths:
+        log_record["images"] = image_paths
+    if args.preset:
+        log_record["preset"] = args.preset
+    append_log(log_record)
 
     if wants_json and rendered is None:
-        return 2
+        return error(
+            "model output was not valid JSON despite --json",
+            "The model may not support JSON mode. Try without --json, or use a different model."
+        )
     return 0
 
 
+# ---------------------------------------------------------------------------
+# init subcommand
+# ---------------------------------------------------------------------------
+
+def _interactive_config() -> Dict[str, str]:
+    current = load_json(config_path())
+    print("llm-call init — interactive setup. Press Enter to keep the [current] value.\n")
+
+    def _prompt(question: str, default: str = "") -> str:
+        suffix = f" [{default}]" if default else ""
+        raw = input(f"{question}{suffix}: ").strip()
+        return raw or default
+
+    base_url = _prompt("base_url", current.get("base_url", "http://localhost:8317/v1"))
+    entered_key = getpass.getpass("api_key (input hidden; press Enter to keep current): ").strip()
+    api_key = entered_key or current.get("api_key", "")
+    model = _prompt("model", current.get("model", ""))
+    api_mode = _prompt("api_mode", current.get("api_mode", "chat_completions"))
+    return {"base_url": base_url, "model": model, "api_key": api_key, "api_mode": api_mode}
+
+
+def cmd_init(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="llm-call init",
+        description="Initialize or update ~/.llm-call: writes config.json (merge) and ensures built-in presets exist.",
+    )
+    parser.add_argument("--base-url", help="OpenAI-compatible base URL. Omit to keep existing.")
+    parser.add_argument("--model", help="Model name. Omit to keep existing.")
+    parser.add_argument("--api-key", help="API key. Omit to keep existing (use getpass in interactive mode).")
+    parser.add_argument("--api-mode", help="API mode (default: chat_completions). Omit to keep existing.")
+    args = parser.parse_args(argv)
+
+    has_config_flag = any([args.base_url, args.model, args.api_key, args.api_mode])
+
+    if has_config_flag:
+        updates = {
+            "base_url": args.base_url or "",
+            "model": args.model or "",
+            "api_key": args.api_key or "",
+            "api_mode": args.api_mode or "",
+        }
+        cfg = merge_config(updates)
+    else:
+        if sys.stdin.isatty():
+            cfg = _interactive_config()
+        else:
+            return error(
+                "init: no flags given and stdin is not a tty (cannot prompt interactively)",
+                "Pass the fields to update, e.g.: python scripts/llm_call.py init --base-url URL --model MODEL --api-key KEY"
+            )
+
+    try:
+        write_config(cfg)
+        seed_presets()
+    except OSError as exc:
+        hint = perm_hint(exc) or f"Check permissions on {llm_call_home()}."
+        return error(f"init: write failed: {exc}", hint)
+
+    print_resolved(cfg)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# preset subcommand
+# ---------------------------------------------------------------------------
+
+def _confirm(prompt: str) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    return input(f"{prompt} [y/N]: ").strip().lower() in {"y", "yes"}
+
+
+def cmd_preset(argv: list[str]) -> int:
+    from _presets import available_preset_names
+
+    parser = argparse.ArgumentParser(prog="llm-call preset", description="Manage ~/.llm-call/presets.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("list", help="List available presets.")
+
+    p_show = sub.add_parser("show", help="Print a preset as JSON.")
+    p_show.add_argument("name")
+
+    p_add = sub.add_parser("add", help="Create a preset from flags.")
+    p_add.add_argument("name")
+    p_add.add_argument("--system", required=True, help="System message.")
+    p_add.add_argument("--user-template", required=True, help="User template; use {{input}} / {{prompt}} placeholders.")
+    p_add.add_argument("--description", default="", help="Short description shown in preset list.")
+    p_add.add_argument("--temperature", type=float, default=None)
+    p_add.add_argument("--json", action="store_true", help="Request JSON-only output.")
+    p_add.add_argument("--force", action="store_true", help="Overwrite if exists.")
+
+    p_edit = sub.add_parser("edit", help="Open a preset in $EDITOR.")
+    p_edit.add_argument("name")
+
+    p_remove = sub.add_parser("remove", help="Delete a preset file.")
+    p_remove.add_argument("name")
+    p_remove.add_argument("--force", action="store_true", help="Skip confirmation.")
+
+    p_reset = sub.add_parser("reset", help="Overwrite all presets with defaults.")
+    p_reset.add_argument("--force", action="store_true", help="Skip confirmation.")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "list":
+        names = available_preset_names()
+        if not names:
+            print(f"No presets in {presets_dir()}.")
+            print("Run `python scripts/llm_call.py init` to seed built-ins, or `preset add` to create one.")
+            return 0
+        print("Presets (use with `llm_call.py --preset NAME`):")
+        for name in names:
+            data = load_json(presets_dir() / f"{name}.json")
+            desc = data.get("description") or ""
+            print(f"  {name}" + (f" — {desc}" if desc else ""))
+        return 0
+
+    if args.command == "show":
+        path = presets_dir() / f"{args.name}.json"
+        data = load_json(path)
+        if not data:
+            return error(
+                f"preset {args.name!r} not found (or file is invalid)",
+                "Run: python scripts/llm_call.py preset list"
+            )
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "add":
+        path = presets_dir() / f"{args.name}.json"
+        if path.exists() and not args.force:
+            return error(
+                f"preset {args.name!r} already exists",
+                "Use --force to overwrite."
+            )
+        data: Dict[str, Any] = {"system": args.system, "user_template": args.user_template}
+        if args.description:
+            data["description"] = args.description
+        if args.temperature is not None:
+            data["temperature"] = args.temperature
+        if args.json:
+            data["json"] = True
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"wrote {path}")
+        return 0
+
+    if args.command == "edit":
+        path = presets_dir() / f"{args.name}.json"
+        if not path.exists():
+            return error(
+                f"preset {args.name!r} not found",
+                "Run: python scripts/llm_call.py preset list"
+            )
+        editor = os.environ.get("EDITOR") or ("notepad" if os.name == "nt" else "vi")
+        try:
+            subprocess.call([editor, str(path)])
+        except OSError as exc:
+            print(f"could not launch editor {editor!r}: {exc}")
+            print(f"Edit the file directly: {path}")
+            return 1
+        return 0
+
+    if args.command == "remove":
+        path = presets_dir() / f"{args.name}.json"
+        if not path.exists():
+            return error(
+                f"preset {args.name!r} not found",
+                "Run: python scripts/llm_call.py preset list"
+            )
+        if not args.force and not _confirm(f"Remove preset {args.name!r}?"):
+            print("aborted.")
+            return 0
+        path.unlink()
+        print(f"removed {path}")
+        return 0
+
+    if args.command == "reset":
+        src = defaults_presets_dir()
+        if not src.exists():
+            return error(f"seed presets not found at {src}")
+        dst = presets_dir()
+        dst.mkdir(parents=True, exist_ok=True)
+        targets = sorted(src.glob("*.json"))
+        existing = [p.stem for p in targets if (dst / p.name).exists()]
+        if existing and not args.force:
+            if not _confirm(f"Reset will overwrite: {', '.join(existing)}?"):
+                print("aborted (pass --force to skip this prompt).")
+                return 0
+        for src_file in targets:
+            shutil.copyfile(src_file, dst / src_file.name)
+        print(f"reset presets to defaults: {', '.join(p.stem for p in targets)}")
+        return 0
+
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# Top-level help and entry point
+# ---------------------------------------------------------------------------
+
+def _print_top_help() -> None:
+    print("""usage: llm_call.py [-h | --help]
+       llm_call.py [PROMPT ...] [options]
+       llm_call.py init [options]
+       llm_call.py preset <list|show|add|edit|remove|reset> [options]
+
+Standalone single-shot LLM CLI: no tools, no memory, no session history.
+Model output goes to stdout. Each call is logged to ~/.llm-call/log.jsonl.
+
+subcommands:
+  (default)    Make an LLM call.
+               Options: --system, --preset, --model, --temperature, --json,
+               --max-tokens, --image, --lint, --lint-override, --timeout,
+               --show-config, --list-presets
+  init         Write or merge ~/.llm-call/config.json and seed built-in presets.
+  preset       Manage presets: list, show, add, edit, remove, reset.
+
+Run `llm_call.py <subcommand> --help` for subcommand-specific options.
+
+examples:
+  python scripts/llm_call.py "把这句话改得更温和：我不同意这个方案"
+  echo "text" | python scripts/llm_call.py --preset summarize --json
+  python scripts/llm_call.py init --base-url URL --model MODEL --api-key KEY
+  python scripts/llm_call.py preset list
+  python scripts/llm_call.py preset add my-preset --system S --user-template '{{input}}'
+""")
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+
+    if args and args[0] in ("-h", "--help", "help"):
+        _print_top_help()
+        return 0
+    if args and args[0] == "init":
+        return cmd_init(args[1:])
+    if args and args[0] == "preset":
+        return cmd_preset(args[1:])
+    return cmd_call(args)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        # Catch-all: no raw tracebacks leak to the agent. Print a clean
+        # actionable error to stdout instead.
+        hint = perm_hint(exc) or "This may be a bug. Run with --show-config to verify setup, or check the command syntax with --help."
+        print(f"[llm-call error] unexpected failure: {exc}", flush=True)
+        print(f"[llm-call hint] {hint}", flush=True)
+        raise SystemExit(1)

@@ -1,5 +1,6 @@
 {
   "system": "You are an independent evaluator. Use only the provided input. Be concise.",
   "user_template": "Evaluate the following content. Return a brief verdict, rationale, and improvement suggestion.\n\nInput:\n\"\"\"\n{{input}}\n\"\"\"",
-  "temperature": 0
+  "temperature": 0,
+  "description": "independent evaluator: verdict, rationale, improvement"
 }

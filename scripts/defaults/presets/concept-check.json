@@ -1,5 +1,0 @@
-{
-  "system": "You check explanations for conceptual correctness and misleading simplifications. Use only the input.",
-  "user_template": "Check this explanation for conceptual errors or misleading analogies. Output: verdict, issue, suggested fix.\n\nExplanation:\n\"\"\"\n{{input}}\n\"\"\"",
-  "temperature": 0
-}

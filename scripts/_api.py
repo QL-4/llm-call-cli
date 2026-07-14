@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import json
-import urllib.error
-import urllib.request
+import http.client
+from urllib.parse import urlparse
 from typing import Any, Dict
 
 from _config import LlmCallError
@@ -24,62 +24,86 @@ _HTTP_HINTS: Dict[int, str] = {
 }
 
 
-def post_chat_completions(request_url: str, api_key: str, body: Dict[str, Any], timeout: float) -> Dict[str, Any]:
-    payload = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        request_url,
-        data=payload,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-    )
+def _request(
+    method: str,
+    url: str,
+    api_key: str,
+    timeout: float,
+    body: bytes | None = None,
+) -> Dict[str, Any]:
+    """Send an HTTP request using http.client."""
+    parsed = urlparse(url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port
+    path = parsed.path or "/"
+
+    if parsed.scheme == "https":
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        hint = _HTTP_HINTS.get(exc.code, "Check config with: python scripts/llm_call.py --show-config")
-        if exc.code == 400:
-            hint += f" Detail: {detail[:300]}"
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        status = resp.status
+
+        if status >= 400:
+            detail = raw.decode("utf-8", errors="replace")[:500]
+            hint = _HTTP_HINTS.get(status, "Check config with: python scripts/llm_call.py --show-config")
+            if status == 400:
+                hint += f" Detail: {detail[:300]}"
+            raise LlmCallError(
+                f"HTTP {status} from LLM endpoint ({url}).\n  Detail: {detail}",
+                hint,
+            )
+
+        return json.loads(raw.decode("utf-8"))
+    except http.client.HTTPException as exc:
         raise LlmCallError(
-            f"HTTP {exc.code} from LLM endpoint ({request_url}).\n  Detail: {detail[:500]}",
-            hint,
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise LlmCallError(
-            f"Cannot reach LLM endpoint at {request_url}.\n  Reason: {exc.reason}",
+            f"HTTP protocol error from LLM endpoint ({url}).\n  Reason: {exc}",
             "Check that the base_url is correct and the server is running. Use: python scripts/llm_call.py --show-config"
         ) from exc
+    except (ConnectionRefusedError, ConnectionResetError) as exc:
+        raise LlmCallError(
+            f"Cannot connect to LLM endpoint at {url}.\n  Reason: {exc}",
+            "Check that the server is running and base_url is correct. Use: python scripts/llm_call.py --show-config"
+        ) from exc
+    except TimeoutError as exc:
+        raise LlmCallError(
+            f"Connection to LLM endpoint timed out ({url}).\n  Reason: {exc}",
+            "The server may be overloaded or the network is slow. Try again or increase --timeout."
+        ) from exc
+    except OSError as exc:
+        raise LlmCallError(
+            f"Network error reaching LLM endpoint ({url}).\n  Reason: {exc}",
+            "Check network connectivity and base_url. Use: python scripts/llm_call.py --show-config"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise LlmCallError(
+            f"LLM endpoint returned invalid JSON ({url}).\n  Response: {raw.decode('utf-8', errors='replace')[:300]}",
+            "The endpoint may have returned an error page or HTML instead of JSON. Check the model name and base_url."
+        ) from exc
+    finally:
+        conn.close()
+
+
+def post_chat_completions(
+    request_url: str, api_key: str, body: Dict[str, Any], timeout: float
+) -> Dict[str, Any]:
+    payload = json.dumps(body).encode("utf-8")
+    return _request("POST", request_url, api_key, timeout, body=payload)
+
 
 def get_models(base_url: str, api_key: str, timeout: float) -> list[dict]:
     """GET /v1/models and return the 'data' list."""
     request_url = base_url.rstrip("/") + "/models"
-    req = urllib.request.Request(
-        request_url,
-        method="GET",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-            body = json.loads(raw)
-            return body.get("data", [])
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        hint = _HTTP_HINTS.get(exc.code, "Check config with: python scripts/llm_call.py --show-config")
-        raise LlmCallError(
-            f"HTTP {exc.code} from LLM endpoint ({request_url}).\n  Detail: {detail[:500]}",
-            hint,
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise LlmCallError(
-            f"Cannot reach LLM endpoint at {request_url}.\n  Reason: {exc.reason}",
-            "Check that the base_url is correct and the server is running. Use: python scripts/llm_call.py --show-config"
-        ) from exc
+    result = _request("GET", request_url, api_key, timeout)
+    return result.get("data", [])

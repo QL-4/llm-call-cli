@@ -18,6 +18,7 @@ printf '文章内容...' | python scripts/llm_call.py --preset summarize
 printf '文章内容...' | python scripts/llm_call.py --preset extract-claims --json
 python scripts/llm_call.py --list-presets
 python scripts/llm_call.py --show-config      # api_key is redacted
+python scripts/llm_call.py --list-models
 ```
 
 Model output goes to stdout. Each call appends one JSON record (prompt, model, output; no api_key) to `~/.llm-call/log.jsonl`.
@@ -35,14 +36,17 @@ Options:
 --lint-override R    Bypass the placeholder lint with a stated reason
 --timeout SECONDS    HTTP timeout (default: 900 = 15 min)
 --show-config        Print resolved model/base_url with api_key redacted
+--list-models        List available models from the configured endpoint
+```
 ```
 
-Example with vision:
+### Prompting rules
 
-```bash
-python scripts/llm_call.py --model mimo-v2.5 --image /path/to/image.png "描述这张图片"
-python scripts/llm_call.py --model mimo-v2.5 --image img1.png --image img2.png "对比两张图片"
-```
+When invoking llm_call.py, do not pass --timeout — use the default (900 s).
+
+1. Put the task in the prompt argument and the source text in stdin.
+2. `--temperature 0` for checking/extraction/judging; higher (e.g. `0.7`) for creative drafting.
+3. Treat output as model text, not verified fact; verify important claims separately.
 
 ## Config
 
@@ -123,17 +127,16 @@ python scripts/llm_call.py --model mimo-v2.5 --preset describe-image --image /pa
 
 # Custom task with vision
 python scripts/llm_call.py --model mimo-v2.5 --image photo.jpg "这张图里有几个人？"
+python scripts/llm_call.py --model mimo-v2.5 --image img1.png --image img2.png "对比两张图片"
 
 # Pipe description into a text-only model for follow-up reasoning
 python scripts/llm_call.py --model mimo-v2.5 --preset describe-image --image fig.png \
   | python scripts/llm_call.py "根据以上图像描述，指出需要改进的地方"
 ```
+## Web search
 
-## Prompting rules
+Use `--model grok-4.5` for tasks that need real-time web search:
 
-1. Put the task in the prompt argument and the source text in stdin.
-2. `--temperature 0` for checking/extraction/judging; higher (e.g. `0.7`) for creative drafting.
-3. Treat output as model text, not verified fact; verify important claims separately.
-
-
-
+```bash
+python scripts/llm_call.py --model grok-4.5 "搜索最近一周AI领域的重大新闻"
+```

@@ -47,7 +47,7 @@ from _presets import (
     load_preset, read_stdin, render_template,
     lint_invocation, print_presets,
 )
-from _api import post_chat_completions
+from _api import get_models, post_chat_completions
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +72,7 @@ def cmd_call(argv: list[str]) -> int:
     parser.add_argument("--image", action="append", dest="images", help="Image file path(s) to include in the request (can be used multiple times).")
     parser.add_argument("--timeout", type=float, default=900, help="Request timeout seconds (default: 900 = 15 min).")
     parser.add_argument("--show-config", action="store_true", help="Print resolved model/base_url with api_key redacted.")
+    parser.add_argument("--list-models", action="store_true", help="List available models from the endpoint and exit.")
     args = parser.parse_args(argv)
 
     if args.list_presets:
@@ -81,6 +82,21 @@ def cmd_call(argv: list[str]) -> int:
     if args.show_config:
         resolved = resolve_config(args.model, strict=False)
         print(json.dumps({k: ("[REDACTED]" if k == "api_key" and v else v) for k, v in resolved.items()}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.list_models:
+        resolved = resolve_config(args.model, strict=False)
+        if not resolved.get('api_key'):
+            return error('not configured (api_key missing)', 'Run: python scripts/llm_call.py init --api-key KEY')
+        if not resolved.get('base_url'):
+            return error('not configured (base_url missing)', 'Run: python scripts/llm_call.py init --base-url URL')
+        try:
+            models = get_models(resolved['base_url'], resolved['api_key'], 30)
+        except LlmCallError as exc:
+            return error(str(exc.args[0]), exc.args[1] if len(exc.args) > 1 else '')
+        for m in models:
+            model_id = m.get('id', m.get('name', 'unknown'))
+            print(model_id)
         return 0
 
     prompt = " ".join(args.prompt).strip()
@@ -433,6 +449,8 @@ subcommands:
                Options: --system, --preset, --model, --temperature, --json,
                --max-tokens, --image, --lint, --lint-override, --timeout,
                --show-config, --list-presets
+               --list-models
+
   init         Write or merge ~/.llm-call/config.json and seed built-in presets.
   preset       Manage presets: list, show, add, edit, remove, reset.
 
@@ -472,3 +490,7 @@ if __name__ == "__main__":
         print(f"[llm-call error] unexpected failure: {exc}", flush=True)
         print(f"[llm-call hint] {hint}", flush=True)
         raise SystemExit(1)
+
+
+
+

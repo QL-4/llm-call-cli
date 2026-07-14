@@ -54,3 +54,32 @@ def post_chat_completions(request_url: str, api_key: str, body: Dict[str, Any], 
             f"Cannot reach LLM endpoint at {request_url}.\n  Reason: {exc.reason}",
             "Check that the base_url is correct and the server is running. Use: python scripts/llm_call.py --show-config"
         ) from exc
+
+def get_models(base_url: str, api_key: str, timeout: float) -> list[dict]:
+    """GET /v1/models and return the 'data' list."""
+    request_url = base_url.rstrip("/") + "/models"
+    req = urllib.request.Request(
+        request_url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            body = json.loads(raw)
+            return body.get("data", [])
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        hint = _HTTP_HINTS.get(exc.code, "Check config with: python scripts/llm_call.py --show-config")
+        raise LlmCallError(
+            f"HTTP {exc.code} from LLM endpoint ({request_url}).\n  Detail: {detail[:500]}",
+            hint,
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise LlmCallError(
+            f"Cannot reach LLM endpoint at {request_url}.\n  Reason: {exc.reason}",
+            "Check that the base_url is correct and the server is running. Use: python scripts/llm_call.py --show-config"
+        ) from exc
